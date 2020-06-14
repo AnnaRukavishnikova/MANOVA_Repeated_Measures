@@ -1,0 +1,385 @@
+---
+title: "Программа для MANOVA Repeated для неполных данных с примером"
+author: "Анна Рукавишникова"
+date: '14 июня 2020 г '
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+---
+
+#Загрузка необходимых библиотек
+
+```{r setup, warning=FALSE, results=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(Rfast)
+library(funModeling)
+library(Hmisc)
+library(corrplot)
+library(PerformanceAnalytics)
+library(ggplot2)
+library(plyr)
+library(GGally)
+library(lsmeans)
+library(car) 
+library(MASS)
+library(pracma)
+library("magic")
+library("corpcor")
+library(readxl)
+library(Matrix)
+library(SMFilter)
+library(holodeck)
+library(dplyr)
+
+source("funcsAR_7.R")
+Group <- TRUE
+eps <- 1/10^5
+```
+
+#Описание требований к входным данным
+
+Входные данные для анализа должны содержать следующие переменные: 
+* группировочная переменная $group$ (со значениями 1,2) типа numeric,
+* переменные, измеряемые в несколько моментов времени в виде $COLr_k$ -- $r$-ая переменная в $k$-ый момент времени, где $r = 1, \ldots, p$, $k = 1, \ldots, t$ типа numeric. Здесь подразумевается не ограничение на названия переменных, а их чёткий порядок внутри датафрейма, который необходим для правильной работы программы.
+
+!Важно, чтобы группировочная переменная была определена для всех имеющихся наблюдений.
+
+```{r}
+data_example <- sim_cat(n_obs = 10, n_groups = 2, name = "group") %>% 
+  sim_covar(n_vars = 9, var = 1, cov = 0.0, name = "COL") %>% 
+  group_by(group) %>% 
+  ungroup()
+data_example$group <- ifelse(data_example$group == "a",1,2)
+colnames(data_example) <- c("group", "COL1_1","COL1_2","COL1_3","COL2_1","COL2_2","COL2_3","COL3_1","COL3_2","COL3_3")
+data_example
+```
+
+Описание параметров функции MANOVARM_with_missing_data(input_data, g, p, t, effect, epsilon, plt, plot_type, grnames):
+
+* input_data -- входные данные в описанном выше виде,
+* g -- количество групп,
+* p -- количество различных признаков в фиксированной временной точке,
+* t -- количество временных точек,
+* effect ("group", "time", "interaction") -- интересующий эффект: группы, времени или взаимодействия (по умолчанию effect = "group"),
+* epsilon -- параметр критерия остановки итерационного подхода, используемого для оценивания корреляционной матрицы ошибок (по умолчанию epsilon = 0.00001),
+* plt (TRUE, FALSE) -- индикатор, определяющий, нужно ли будет строить график взаимодействия (TRUE (по умолчанию) -- график строится, FALSE - график не строится)
+* plot_type ("plot", "ggplot") -- параметр, определяющий вид графика взаимодействия ("ggplot"(по умолчанию) - цветной график, рисуется с помощью функции ggplot, "plot" - стандартный график, рисуется с помощью функции plot)
+* grnames -- вектор, содержащий названия групп для отображения на графике (порядок названий в векторе важен, т.е. первый элемент вектора соответствует группе 1, второй -- группе 2 и т.д.),
+
+#Реализация методов
+
+```{r}
+#Функция для проверки того, что все элементы в листе одинаковые
+allSame <- function(x) length(unique(x)) == 1
+
+#Функция для предварительной обработки данных, которая обеспечивает: 1)полноту данных по всем признакам в первой временной точке(где должно быть меньше всего пропусков), 2)согласованность пропусков в каждой строке данных
+data_preparation <- function(input_data,p,t) {
+  
+  df <- input_data
+  
+  #обеспечиваем полноту данных по всем признакам в первой временной точке
+  df1 <- df[complete.cases(df[,c(1,seq(2,ncol(df),t))]),]
+  
+  #обеспечиваем согласованность пропусков в данных
+  df2 <- df1
+
+  for (i in (1:nrow(df1))) {
+    for (j in (1:(t-1))) {
+      if (! (((sum(is.na(df1[i,seq((2+j),ncol(df1),t)])) == 0) | (sum(is.na(df1[i,seq((2+j),ncol(df1),t)])) == p)))) {
+        df2[i,c(seq((2+j),ncol(df1),t))] <- rep(NA,p)
+      }
+    }
+  }
+
+  return(df2)
+}
+
+#Функция для нахождения коэффициентов линейной комбинации, обеспечивающих максимальное различие между индивидами по фактору группы
+group_effect <- function(input_data, g, p, t, epsilon) {
+  
+  df3 <- data_preparation(input_data,p,t)
+  
+  #рассматриваем одномерные повторные наблюдения с пропусками в рамках каждого признака
+  Z.all <- list()
+  H.all <- list()
+  H_.all <- list()
+  S_.all <- list()
+  theta_hat.all <- list()
+  mu_hat.all <- list()
+
+  j <- 1
+  
+  #цикл по всем различным признакам
+  for (i in seq(2,ncol(df3),t)) {
+    
+    df4 <- df3[,c(1,i:(i+(t-1)))]
+    ANOVA_RM <- AU.2(df4, eps, Group)
+    Z.all[[j]] <- ANOVA_RM$group.params$Z
+    H.all[[j]] <- as.matrix(ANOVA_RM$group.params$H)
+    S_.all[[j]] <- as.matrix(ANOVA_RM$group.params$R_)
+    H_.all[[j]] <- as.matrix(ANOVA_RM$group.params$H_)
+    theta_hat.all[[j]] <- ANOVA_RM$group.params$teta
+    mu_hat.all[[j]] <- ANOVA_RM$group.params$mu
+    j <- j + 1
+  }
+  
+  #матрица наблюдений
+  Z <- do.call(cbind, Z.all)
+
+  #матрицы плана полной и усечённой моделей
+  if ((length(unique(H.all)) == 1) & (length(unique(H_.all)) == 1)) {
+    H <- H.all[[1]]
+    H_ <- H_.all[[1]]
+  } else {print("Ошибка: разные матрицы плана")}
+
+  #оценка матрицы параметров для полной модели
+  theta_hat <- do.call(cbind, theta_hat.all)
+
+  #оценка матрицы параметров для усечённой модели
+  mu_hat <- do.call(cbind, mu_hat.all)
+  
+  #итерационная продедура оценивания корреляционной матрицы ошибок линейной комбинации S
+  S_L <- eye(nrow(H))
+  repeat
+  {
+    S_L_1 <- S_L
+
+    #матрицы остаточных сумм квадратов и произведений
+    R0 <- data.frame(matrix(NA, nrow = p, ncol = p))
+    R1 <- data.frame(matrix(NA, nrow = p, ncol = p))
+
+    for (i in 1:p)
+    {
+      for (j in 1:p)
+      {
+          R0[i,j] <- t(Z.all[[i]] - H%*%theta_hat.all[[i]]) %*% S_L%*% (Z.all[[j]] - H%*%theta_hat.all[[j]])
+          R1[i,j] <- t(Z.all[[i]] - H_%*%mu_hat.all[[i]]) %*%S_L%*% (Z.all[[j]] - H_%*%mu_hat.all[[j]])
+      }
+    }
+    
+    R0 <- as.matrix(R0)
+    R1 <- as.matrix(R1)
+    
+    #Находим собственный вектор, т.е. коэффициенты линейной комбинации
+    A <- sapply((eigen(solve(R0)%*%(R1-R0)))$vectors[,which.max(eigen(solve(R0)%*%(R1-R0))$values)], Re)
+    
+    #Считаем p-значение из ANOVA Repeated, используя полученные коэффициенты линейной комбинации
+    df5 <- data.frame(matrix(NA, nrow = nrow(df3), ncol = 1))
+    colnames(df5) <- "group"
+    df5$group <- df3$group
+    for (i in c(2:(t+1)))
+    {
+      df5[,i] <- as.matrix(df3[,c(seq(i,ncol(df3),t))])%*%A
+    }
+    
+    ANOVA_RM <- AU.2(df5,eps,Group)
+    p.val<- ANOVA_RM$P.values[2]
+    
+    S_L <- ANOVA_RM$group.params$R_
+  
+    if (FDist2(S_L,S_L_1) <= epsilon) {break}
+  }
+  
+  #вычисляем матрицы остаточных сумм квадратов и произведений
+  R0 <- data.frame(matrix(NA, nrow = p, ncol = p))
+  R1 <- data.frame(matrix(NA, nrow = p, ncol = p))
+
+  for (i in 1:p)
+    {
+    for (j in 1:p)
+      {
+      R0[i,j] <- t(Z.all[[i]] - H%*%theta_hat.all[[i]]) %*% S_L%*% (Z.all[[j]] - H%*%theta_hat.all[[j]])
+      R1[i,j] <- t(Z.all[[i]] - H_%*%mu_hat.all[[i]]) %*%S_L%*% (Z.all[[j]] - H_%*%mu_hat.all[[j]])
+      }
+    }
+  
+  R0 <- as.matrix(R0)
+  R1 <- as.matrix(R1)
+
+  #находим собственный вектор, т.е. искомые коэффициенты линейной комбинации
+  A <- sapply((eigen(solve(R0)%*%(R1-R0)))$vectors[,which.max(eigen(solve(R0)%*%(R1-R0))$values)], Re)
+  if (all(A < 0)) {A <- -A}
+  
+  df5 <- data.frame(matrix(NA, nrow = nrow(df3), ncol = 1))
+  colnames(df5) <- "group"
+  df5$group <- df3$group
+  for (i in c(2:(t+1)))
+    {
+    df5[,i] <- as.matrix(df3[,c(seq(i,ncol(df3),t))])%*%A
+    }
+
+  colnames(df5) <- c("group",paste("Time", 1:t, sep = ""))
+  
+  ANOVA_RM <- AU.2(df5, eps,Group)
+
+  p_value<- ANOVA_RM$P.values[2]
+  
+  return(list(arm_data=df5, A=A, p_value = p_value))
+}
+
+#Функция для нахождения коэффициентов линейной комбинации, обеспечивающих максимальное различие между индивидами по факторам времени или взаимодействия
+time_and_interaction_effect <- function(input_data, g, p, t, effect) {
+  
+  df3 <- data_preparation(input_data,p,t)
+  
+  #рассматриваем одномерные повторные наблюдения с пропусками в рамках каждого признака
+  Y.all <- list()
+  H.all <- list()
+  Lambda.all <- list()
+
+  j <- 1
+  
+  for (i in seq(2,ncol(df3),t)) {
+    df4 <- df3[,c(1,i:(i+(t-1)))]
+    ANOVA_RM <- AU.2(df4, eps, Group)
+    Y.all[[j]] <- ANOVA_RM$ep$Y
+    H.all[[j]] <- as.matrix(ANOVA_RM$ep$plan)
+    Lambda.all[[j]] <- as.matrix(ANOVA_RM$ep$Lambda)
+    j <- j + 1
+}
+
+  #матрица наблюдений
+  Y <- as.matrix(do.call(cbind, Y.all))
+  
+  #матрица плана полной и усечённой моделей
+  if (allSame(H.all) == TRUE) {
+    H <- H.all[[1]]
+    if (effect == "time") {H_u <- as.matrix(H[,-c(seq(1,ncol(H),g))])}
+    else if (effect == "interaction") {H_u <- as.matrix(H[,c(seq(1,ncol(H),g))])}
+    } else print("Ошибка: разные матрицы план")
+
+  if (allSame(lapply(Lambda.all,function(x) rownames(x) <- c())) == TRUE) {Lambda <- Lambda.all[[1]]} else   print("Ошибка: разные корреляционные матрицы")
+  
+  #оценка матрицы параметров для полной модели
+  theta_hat<- ginv(t(H)%*%ginv(Lambda)%*%H)%*%(t(H)%*%ginv(Lambda)%*%Y)
+  
+  #оценка матрицы параметров усечённой модели
+  theta_hat_u <- ginv(t(H_u)%*%ginv(Lambda)%*%H_u)%*%(t(H_u)%*%ginv(Lambda)%*%Y)
+
+  #матрицы остаточных сумм квадратов и произведений
+  R0 <- t(Y - H%*%theta_hat)%*%ginv(Lambda)%*%(Y - H%*%theta_hat)
+  R1 <- t(Y - H_u%*%theta_hat_u)%*%ginv(Lambda)%*%(Y - H_u%*%theta_hat_u)
+
+
+  #Получаем коэффициенты линейной комбинации
+  A <- sapply((eigen(solve(R0)%*%(R1-R0)))$vectors[,which.max(eigen(solve(R0)%*%(R1-R0))$values)], Re)
+  if (all(A < 0)) {A <- -A}
+    
+  #Считаем p-значение из ANOVA Repetaed, используя полученные коэффициенты линейной комбинации.
+  df5 <- data.frame(matrix(NA, nrow = nrow(df3), ncol = 1))
+  colnames(df5) <- "group"
+  df5$group <- df3$group
+  
+  for (i in c(2:(t+1)))
+      {
+        df5[,i] <- as.matrix(df3[,c(seq(i,ncol(df3),t))])%*%A
+  }
+  
+  colnames(df5) <- c("group",paste("Time", 1:t, sep = ""))
+
+  ANOVA_RM <- AU.2(df5,eps,Group)
+  
+  if (effect == "time") {p_value <- ANOVA_RM$P.values[3]}
+  else if (effect == "interaction") {p_value <- ANOVA_RM$P.values[4]}
+    
+  return(list(arm_data = df5, A=A, p_value = p_value))
+}
+
+#Построение графика взаимодействия
+interaction_plot <- function(arm_data, grnames, g, t, type) {
+  
+  df5 <- arm_data
+  
+  val <- do.call("rbind", lapply(c(1:g), function(y) do.call("rbind", lapply(2:(t+1), function(x) na.omit(df5[df5$group == y,x])))))
+  
+  ng <- lapply(c(1:g), function(y) sapply(2:(t+1), function(x) length(na.omit(df5[df5$group == y,x]))))
+  
+  gr <- data.frame(grnames,  stringsAsFactors=FALSE)
+  gr$counts <- sapply(ng, function(x) sum(x))
+
+  group <- data.frame(do.call(c,sapply(c(1:nrow(gr)), function(x) rep(gr[x,1],gr[x,2]))))
+  
+  rept <- rbind(rep(c(1:t),g),do.call(c, ng))
+  time <- data.frame(do.call(c, sapply(c(1:ncol(rept)), function(x) rep(rept[1,x],rept[2,x]))))
+  
+  interaction_df <- cbind(val,group,time)
+
+  colnames(interaction_df) <- c('value','group','time')
+  
+  if (type == "plot")
+  {
+   plot(interaction.plot(interaction_df$time, interaction_df$group, interaction_df$value, xlab = 'Момент времени', ylab = 'Среднее значение <<нового признака>>', trace.label = 'Группа',main = "График взаимодействия"))
+  }
+  
+  else if (type == "ggplot")
+  {
+    interaction_df$time.cat <- factor(interaction_df$time, labels=paste("t", c(1:t), sep=""))
+    df <- with(interaction_df , aggregate(value, list(group=group, time=time.cat), mean))
+    df$n <- do.call(c, ng)
+
+    lp <- ggplot(data = df, aes(x = time, y = x, group = group, shape = group, colour = group, linetype = group)) + geom_line() + geom_point(size = 3)
+
+    plot(lp + scale_colour_discrete(name  ="Группа", breaks=grnames, labels=grnames) +
+         scale_shape_discrete(name  ="Группа", breaks=grnames, labels=grnames) +
+         scale_linetype_discrete(name  ="Группа", breaks=grnames, labels=grnames) +
+         theme_bw() + ylab("Среднее значене <<нового признака>> ") + xlab("Время") +
+         ggtitle("График взаимодействия"))
+  }
+
+  
+}
+
+MANOVARM_with_missing_data <- function(input_data, g, p, t, effect = "group", epsilon = 0.00001, plt = TRUE, plot_type = "ggplot", grnames = c("group1","group2")) {
+  
+  if (effect == "group") {
+    results <- group_effect(input_data, g, p, t, epsilon)
+  } else 
+  if ((effect == "time") | (effect == "interaction")) {
+    results <- time_and_interaction_effect(input_data, g, p, t, effect)
+  }
+    
+  if (plt == TRUE) {
+    arm_data <- results$arm_data
+    interaction_plot(arm_data, grnames, g, t, plot_type)
+  }
+
+  
+  #в качестве результата работы программы, будем выдавать p-value, вектор коэффициентов линейной комбинации и график взаимодействия (при необходимости)
+  A <- results$A
+  p_value <- results$p_value
+  
+  return(list(A=A, p_value = p_value))
+}
+```
+
+#Демонстрация работы программы для реальных данных
+
+```{r, warning=FALSE, results=FALSE}
+Cryodestruction_data <- read_csv("C:/Master_degree/Cryodestruction_data.csv")
+data <- Cryodestruction_data[,-1]
+head(data)
+```
+
+##Эффект группы
+```{r}
+res <- MANOVARM_with_missing_data(input_data = data, g = 2, p = 2, t = 2, effect = "group", plt = FALSE)
+res$A
+res$p_value
+```
+
+##Эффект времени
+```{r}
+res <- MANOVARM_with_missing_data(input_data = data, g = 2, p = 2, t = 2, effect = "time", plt = FALSE)
+res$A
+res$p_value
+```
+
+##Эффект взаимодействия
+```{r}
+res <- MANOVARM_with_missing_data(input_data = data, g = 2, p = 2, t = 2, effect = "interaction", plt = TRUE, plot_type = "ggplot", grnames = (c("Без криотомии", "С криотомией")))
+res$A
+res$p_value
+```
